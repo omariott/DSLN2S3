@@ -4,16 +4,14 @@
 
 package dsl
 
-import fr.univ_lille.cristal.emeraude.n2s3.core.NeuronModel
-import fr.univ_lille.cristal.emeraude.n2s3.core.models.properties.MembraneThresholdPotential
+import fr.univ_lille.cristal.emeraude.n2s3.core.{NeuronModel, Property}
 import fr.univ_lille.cristal.emeraude.n2s3.features.builder.connection.ConnectionPolicy
 import fr.univ_lille.cristal.emeraude.n2s3.features.builder.connection.types.FullConnection
-import fr.univ_lille.cristal.emeraude.n2s3.features.builder.{ConnectionRef, N2S3, NeuronGroupObserverRef, NeuronGroupRef}
+import fr.univ_lille.cristal.emeraude.n2s3.features.builder.{ConnectionRef, N2S3, NeuronGroupRef}
 import fr.univ_lille.cristal.emeraude.n2s3.features.io.input.{SampleInput, SampleUnitInput, StreamSupport}
-import fr.univ_lille.cristal.emeraude.n2s3.features.logging.graph.SynapsesWeightGraphBuilderRef
+import fr.univ_lille.cristal.emeraude.n2s3.features.io.report.BenchmarkMonitorRef
 import fr.univ_lille.cristal.emeraude.n2s3.models.qbg.{QBGNeuron, QBGNeuronConnectionWithNegative}
 import fr.univ_lille.cristal.emeraude.n2s3.support.io.{Input, InputSeq, InputStream, N2S3Input}
-import squants.electro.ElectricPotentialConversions.ElectricPotentialConversions
 
 import scala.collection.mutable
 
@@ -24,12 +22,12 @@ object NetworkImplicits {
   class ConnectionBuilder(originId: String, network: Network[SampleUnitInput, SampleInput]) {
     var destinationId: String = _
 
-    def connectTo(destinationId: String) = {
+    def connectTo(destinationId: String): ConnectionBuilder = {
       this.destinationId = destinationId
       this
     }
 
-    def using(connectionType: ConnectionPolicy) = {
+    def using(connectionType: ConnectionPolicy): Unit = {
       network.getNeuronGroupById(originId)
         .addNeighbour(this.destinationId, connectionType)
     }
@@ -39,12 +37,35 @@ object NetworkImplicits {
     network.getLayer(id)
   }
 
+
+  implicit def stringToNeuronGroup(id: String)(implicit network: Network[SampleUnitInput, SampleInput]): Module = {
+    network.getNeuronGroupById(id)
+  }
+
+
+
   def fixWeights(neuronGroupRef: NeuronGroupRef): Unit = {
     neuronGroupRef.fixNeurons()
   }
 
+  def registerBenchmarkMonitorOn(id: String)(implicit network: Network[SampleUnitInput, SampleInput]): Unit = {
+    network.addBenchmarkObserver(id)
+  }
+
+  implicit def getBenchmarkObserverOn(id: String)(implicit network: Network[SampleUnitInput, SampleInput]): BenchmarkMonitorRef = {
+    network.getBenchmarkObserver(id)
+  }
+
+  def makeSynapsesWeightGraph(originId: String, destinationId: String)(implicit network: Network[SampleUnitInput, SampleInput]): Unit ={
+    network.addSynapsesWeightGraph(originId, destinationId)
+
+  }
+
   class Module(identifier: String) {
+
+
     val id: String = identifier
+    private var neuronParameters: Seq[(Property[_], _)] = Seq()
     private var neuronsCount = 1
     private var neuronModel: NeuronModel = QBGNeuron
     private var neighbours: Seq[(String, ConnectionPolicy)] = Seq()
@@ -59,6 +80,10 @@ object NetworkImplicits {
     def modeling(model: NeuronModel): Module = {
       this.neuronModel = model
       this
+    }
+
+    def withParameters(properties: (Property[_], _)*): Unit = {
+      this.neuronParameters = properties
     }
 
     def makeInput(): Module = {
@@ -77,7 +102,7 @@ object NetworkImplicits {
         (this.id, inputModule)
       }
       else {
-        (this.id, n2S3.createNeuronGroup(this.id, this.neuronsCount).setNeuronModel(this.neuronModel, Seq((MembraneThresholdPotential, 100 millivolts))))
+        (this.id, n2S3.createNeuronGroup(this.id, this.neuronsCount).setNeuronModel(this.neuronModel, this.neuronParameters))
       }
     }
 
@@ -92,15 +117,18 @@ object NetworkImplicits {
 
   class Network[U <: Input, T <: InputSeq[U]]() {
 
+
     private var modules: Map[String, Module] = Map()
-    private var observers: mutable.MutableList[NeuronGroupObserverRef] = new mutable.MutableList[NeuronGroupObserverRef]()
-    private var firstModuleToBeLinked: Option[String] = None
+    private var benchmarkedModules: mutable.MutableList[String] = new mutable.MutableList[String]()
+    private var graphedConnections: mutable.MutableList[(String, String)] = new mutable.MutableList[(String, String)]()
+    private var originModuleToBeLinked: Option[String] = None
     private var secondModuleToBeLinked: Option[String] = None
     private var connectionToBeUsed: ConnectionPolicy = new FullConnection
     private var input: Option[StreamSupport[T, InputSeq[N2S3Input]]] = None
     private var inputStream: Option[InputStream[T]] = None
     private var lastModule: Option[String] = None
-    var neuronGroups: collection.mutable.Map[String, NeuronGroupRef] = collection.mutable.Map()
+    private val neuronGroups: collection.mutable.Map[String, NeuronGroupRef] = collection.mutable.Map()
+    private val activeBenchmarkObservers: collection.mutable.Map[String, BenchmarkMonitorRef] = collection.mutable.Map()
 
     def has(module: Module): Network[U, T] = {
       addModule(module)
@@ -117,23 +145,15 @@ object NetworkImplicits {
 
     def withInputNeuronGroup(id: String): Module = this.addModule(inputNeuronGroup(id))
 
-    def hasLayer(module: Module) = {
+    def hasLayer(module: Module): Network[U, T] = {
       this.modules += (module.id -> module)
       this.modules(this.lastModule.get).addNeighbour(module.id, new FullConnection(() => new QBGNeuronConnectionWithNegative()))
       this.lastModule = Some(module.id)
       this
     }
 
-    def getNeuronGroupById(id: String) = {
-      this.modules(id)
-    }
-
-    def neuronGroup(moduleId: String): Module = {
-      this.getNeuronGroupById(moduleId)
-    }
-
     def links(id: String): Network[U, T] = {
-      this.firstModuleToBeLinked = Some(id)
+      this.originModuleToBeLinked = Some(id)
       this
     }
 
@@ -144,23 +164,23 @@ object NetworkImplicits {
     }
 
     def connectTemporaries(): Unit = {
-      this.modules(this.firstModuleToBeLinked.get).addNeighbour(this.secondModuleToBeLinked.get, this.connectionToBeUsed)
+      this.modules(this.originModuleToBeLinked.get).addNeighbour(this.secondModuleToBeLinked.get, this.connectionToBeUsed)
       this.clearTemporaries()
     }
 
     def clearTemporaries(): Unit = {
-      this.firstModuleToBeLinked = None
+      this.originModuleToBeLinked = None
       this.secondModuleToBeLinked = None
       this.connectionToBeUsed = new FullConnection
     }
 
-    def taking(input: StreamSupport[T, InputSeq[N2S3Input]], inputStream: InputStream[T]): Network[U, T] = {
+    def hasInput(input: StreamSupport[T, InputSeq[N2S3Input]], inputStream: InputStream[T]): Network[U, T] = {
       this.input = Some(input)
       this.inputStream = Some(inputStream)
       this
     }
 
-    implicit def toN2S3(): N2S3 = {
+    implicit def toN2S3: N2S3 = {
       val n2s3 = new N2S3
 
       def putToMap(module: Module) {
@@ -170,17 +190,29 @@ object NetworkImplicits {
 
       this.modules.values.foreach(putToMap)
       this.modules.values.foreach(_.connect(this.neuronGroups))
-      this.observers.foreach( o => n2s3 addNetworkObserver o )
+      this.benchmarkedModules.foreach(o => this.activeBenchmarkObservers.put(o, n2s3.createBenchmarkMonitor(this.getLayer(o))))
+      this.graphedConnections.foreach(pair => n2s3.createSynapseWeightGraphOn(this.getLayer(pair._1), this.getLayer(pair._2)))
       n2s3
+    }
+
+    def getNeuronGroupById(id: String): Module = {
+      this.modules(id)
     }
 
     def getLayer(ident: String): NeuronGroupRef = {
       this.neuronGroups(ident)
     }
 
-    def addObserver[T <: NeuronGroupObserverRef](ref: T): T = {
-      this.observers += ref
-      ref
+    def addSynapsesWeightGraph(originId: String, destinationId: String): Unit = {
+      this.graphedConnections += originId -> destinationId
+    }
+
+    def addBenchmarkObserver(id: String): Unit = {
+      this.benchmarkedModules += id
+    }
+
+    def getBenchmarkObserver(id: String): BenchmarkMonitorRef = {
+      this.activeBenchmarkObservers(id)
     }
   }
 
